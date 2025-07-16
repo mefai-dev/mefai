@@ -1,6 +1,3 @@
-Below we share our complete backtesting code with file paths and IPs redacted (shown as ????). This is a simple system that calculates performance based solely on our 15-minute trading signals, without complex trade management capabilities.
-
-By making this code publicly available, we enable full transparency - you can see exactly how we calculate and display all backtest results on our main dashboard.
 
 import sqlite3
 
@@ -8,15 +5,49 @@ import pandas as pd
 
 import requests
 
-from datetime import datetime, timedelta
-
-from datetime import timezone
+from datetime import datetime, timedelta, timezone
 
 import time
 
+import json
+
+import os
+
+import shutil
+
 import subprocess
 
-DB_PATH = "/????????????????????????.db"
+from multiprocessing import Pool, cpu_count
+
+# --- Configuration Loading ---
+
+# All sensitive paths and URLs are now loaded from an external config file.
+
+# This makes the script secure for public sharing.
+
+try:
+
+with open('config.json', 'r') as f:
+
+config = json.load(f)
+
+DB_PATH = config['db_path']
+
+OHLCV_API_URL = config['ohlcv_api_url']
+
+FRONTEND_PUBLIC_PATH = config['frontend_public_path']
+
+except FileNotFoundError:
+
+print("❌ CRITICAL ERROR: config.json not found. Please create it before running.")
+
+exit()
+
+except KeyError as e:
+
+print(f"❌ CRITICAL ERROR: Missing key in config.json: {e}")
+
+exit()
 
 INDEX_BLACKLIST = {
 
@@ -26,133 +57,33 @@ INDEX_BLACKLIST = {
 
 }
 
-def init_pnl_cache_table():
+# Standard TP/SL rules for all symbols
 
-conn = sqlite3.connect(DB_PATH)
+ASSET_CONFIG = {
 
-cur = conn.cursor()
+"default": {
 
-cur.execute("""
+"tp1_ratio": 1.02,
 
-CREATE TABLE IF NOT EXISTS daily_pnl_cache (
+"tp2_ratio": 1.03,
 
-symbol TEXT,
-
-day INTEGER,
-
-pnl REAL,
-
-PRIMARY KEY(symbol, day)
-
-)
-
-""")
-
-conn.commit()
-
-conn.close()
-
-def get_pnl_cache(symbol, day):
-
-conn = sqlite3.connect(DB_PATH)
-
-cur = conn.cursor()
-
-cur.execute("SELECT pnl FROM daily_pnl_cache WHERE symbol=? AND day=?", (symbol, day))
-
-row = cur.fetchone()
-
-conn.close()
-
-return row[0] if row else None
-
-def set_pnl_cache(symbol, day, pnl):
-
-conn = sqlite3.connect(DB_PATH)
-
-cur = conn.cursor()
-
-cur.execute("REPLACE INTO daily_pnl_cache (symbol, day, pnl) VALUES (?, ?, ?)", (symbol, day, pnl))
-
-conn.commit()
-
-conn.close()
-
-def normalize_symbol(symbol):
-
-symbol = symbol.replace(".P", "")
-
-special_map = {
-
-"1000BONKUSDT": "BONKUSDT",
-
-"1000FLOKIUSDT": "FLOKIUSDT",
-
-"1000PEPEUSDT": "PEPEUSDT",
-
-"1000SHIBUSDT": "SHIBUSDT"
+"sl_ratio": 0.99
 
 }
 
-return special_map.get(symbol, symbol)
+}
 
-def round_to_15m(ts):
+def clear_pnl_cache():
 
-return ts - (ts % (15 * 60))
-
-def fetch_ohlcv(symbol, start_time, end_time):
-
-MIN_TIME_RANGE = 900
-
-if end_time - start_time < MIN_TIME_RANGE:
-
-end_time = start_time + MIN_TIME_RANGE
-
-url = f"????????????????????:??????????????????????????/ohlcv?symbol={symbol}&interval=15m&start={int(start_time)}&end={int(end_time)}"
-
-time.sleep(0.2)
+"""Clears the old PnL results from the database cache."""
 
 try:
-
-resp = requests.get(url, timeout=15)
-
-result = resp.json()
-
-if isinstance(result, dict) and "error" in result:
-
-print(f"API Error for {symbol}: {result['error']}")
-
-return []
-
-if not result or not isinstance(result, list):
-
-print(f"Empty OHLCV data for {symbol}")
-
-return []
-
-return result
-
-except Exception as e:
-
-print(f"Failed to fetch OHLCV for {symbol}: {str(e)}")
-
-return []
-
-def calculate_trade_pnl(direction, entry_price, exit_price, qty, portion):
-
-if direction == "buy":
-
-return max((exit_price - entry_price) * qty * portion, 0)
-
-else:
-
-return max((entry_price - exit_price) * qty * portion, 0)
-
-def run_backtest():
 
 conn = sqlite3.connect(DB_PATH)
 
 cur = conn.cursor()
+
+cur.execute("CREATE TABLE IF NOT EXISTS daily_pnl_cache (symbol TEXT, day INTEGER, pnl REAL, PRIMARY KEY(symbol, day))")
 
 cur.execute("DELETE FROM daily_pnl_cache;")
 
@@ -160,424 +91,265 @@ conn.commit()
 
 conn.close()
 
-print("Cache table cleared.")
+print(f"🧹 PnL Cache table cleared successfully.")
 
-eight_days_ago = int((datetime.now(timezone.utc) - timedelta(days=8)).timestamp()
+except Exception as e:
 
-conn = sqlite3.connect(DB_PATH)
+print(f"❌ Could not clear PnL cache: {e}")
 
-signals_df = pd.read_sql_query(
+def filter_by_candle_close(df, timeframe):
 
-f"""
+"""Filters signals by taking only the last signal of each candle period."""
 
-SELECT * FROM signals
+if df.empty: return df
 
-WHERE timeframe='15m' AND timestamp >= {eight_days_ago}
+df['timestamp_dt'] = pd.to_datetime(df['timestamp'].astype(float), unit='s', utc=True)
 
-ORDER BY symbol, timestamp ASC
+freq_map = {'1h': 'h', '15m': '15min', '30m': '30min', '4h': '4h', '1d': 'D', '5m': '5min', '1m': '1min'}
 
-""",
+freq = freq_map.get(timeframe, 'h')
 
-conn,
+df['candle_start'] = df['timestamp_dt'].dt.floor(freq)
 
-)
+stable_signals_df = df.groupby('candle_start').last().reset_index()
 
-conn.close()
+return stable_signals_df.drop(columns=['timestamp_dt', 'candle_start'])
 
-print("UTC now:", datetime.now(timezone.utc))
+def normalize_symbol(symbol):
 
-print("Sample timestamps (UTC):")
+"""Normalizes symbol names, e.g., 1000PEPEUSDT -> PEPEUSDT."""
 
-print(
+symbol = symbol.replace(".P", "")
 
-signals_df["timestamp"]
+special_map = {"1000BONKUSDT": "BONKUSDT", "1000FLOKIUSDT": "FLOKIUSDT", "1000PEPEUSDT": "PEPEUSDT", "1000SHIBUSDT": "SHIBUSDT"}
 
-.astype(int)
+return special_map.get(symbol, symbol)
 
-.head()
+def fetch_ohlcv_data(symbol, start_ts, end_ts):
 
-.apply(lambda ts: datetime.fromtimestamp(ts, tz=timezone.utc))
+"""Fetches OHLCV data using the URL from the config file."""
 
-)
+url = f"{OHLCV_API_URL}?symbol={symbol}&interval=1m&start={int(start_ts)}&end={int(end_ts)}"
 
-signals_df["date"] = pd.to_datetime(signals_df["timestamp"].astype(int), unit="s", utc=True).dt.date
+try:
 
-signals_df["symbol_clean"] = signals_df["symbol"].apply(normalize_symbol)
+resp = requests.get(url, timeout=60)
 
-all_symbols = signals_df["symbol"].unique()
+data = resp.json()
 
-today_utc = datetime.now(timezone.utc).date()
+if not data or not isinstance(data, list) or (isinstance(data, dict) and "error" in data): return None
 
-yesterday_utc = today_utc - timedelta(days=1)
+df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
-days = [yesterday_utc - timedelta(days=i) for i in range(6, -1, -1)]
+for col in df.columns: df[col] = pd.to_numeric(df[col])
 
-results = {}
+return df
 
-for symbol in all_symbols:
+except Exception as e:
 
-if normalize_symbol(symbol) in INDEX_BLACKLIST:
+print(f"Error fetching OHLCV for {symbol}: {e}")
 
-print(f"Skipping INDEX: {symbol}")
+return None
 
-continue
+def calculate_trade_pnl(direction, entry_price, exit_price, qty, portion):
 
-sym_df = signals_df[signals_df["symbol"] == symbol]
+"""Calculates the Profit or Loss for a trade."""
+
+return ((exit_price - entry_price) if direction == "buy" else (entry_price - exit_price)) * qty * portion
+
+def process_symbol(args):
+
+"""The main backtesting logic for a single symbol."""
+
+symbol, timeframe, signals_df, eight_days_ago_ts = args
 
 sym_clean = normalize_symbol(symbol)
 
-pnl_list = []
+print(f"🚀 Processing {symbol} for {timeframe} timeframe...")
 
-for i, day in enumerate(days):
+ohlcv_df = fetch_ohlcv_data(sym_clean, eight_days_ago_ts, int(time.time()))
 
-cache_pnl = get_pnl_cache(symbol, day.day)
+if ohlcv_df is None:
 
-if cache_pnl is not None and i < 6:
+print(f"Could not fetch OHLCV data for {symbol}. Skipping.")
 
-pnl_list.append({"day": day.day, "pnl": round(cache_pnl, 2)})
+return symbol, []
 
-continue
+sym_signals = signals_df[signals_df['symbol'] == symbol].copy()
 
-day_df = sym_df[sym_df["date"] == day]
+sym_signals = filter_by_candle_close(sym_signals, timeframe)
 
-print(f"Day {day} for {symbol} - signals found: {len(day_df)}")
+if sym_signals.empty: return symbol, []
 
-if day_df.empty:
+sym_signals["date"] = pd.to_datetime(sym_signals["timestamp"].astype(float), unit='s', utc=True).dt.date
 
-pnl = 0
+config_rules = ASSET_CONFIG["default"]
 
-else:
-
-pnl = 0
+price_multiplier = 1000.0 if "1000" in symbol and symbol.startswith("1000") else 1.0
 
 open_pos = None
 
-for idx, row in day_df.iterrows():
+daily_pnl_map = {}
 
-entry_time = round_to_15m(int(row["timestamp"]))
+for idx, row in sym_signals.iterrows():
+
+entry_time = int(row["timestamp"])
 
 entry_price = float(row["price"])
 
 direction = row["signal"].lower()
 
-qty = 25000 / entry_price
-
 if not open_pos:
 
-open_pos = {
-
-"direction": direction,
-
-"entry": entry_price,
-
-"qty": qty,
-
-"open_time": entry_time,
-
-"half_closed": False,
-
-}
+open_pos = {"direction": direction, "entry": entry_price, "qty": 25000 / entry_price, "open_time": entry_time}
 
 continue
 
-end_time = round_to_15m(int(row["timestamp"]))
+if direction == open_pos["direction"]: continue
 
-try:
+end_time = entry_time
 
-ohlcv = fetch_ohlcv(sym_clean, open_pos["open_time"], end_time)
-
-time.sleep(0.15)
-
-except Exception as e:
-
-print(f"{sym_clean} OHLCV error: {e}")
-
-ohlcv = []
-
-print(f"OHLCV response [{symbol}]: {len(ohlcv)} bars, time: {open_pos['open_time']} → {end_time}")
-
-if ohlcv:
-
-print("First bar:", ohlcv[0])
-
-else:
-
-print("Empty OHLCV response!")
-
-if not ohlcv or not isinstance(ohlcv[0], list):
-
-print(f"Invalid OHLCV data, symbol: {sym_clean}, day: {day}")
-
-last_price = open_pos["entry"]
-
-pnl_this_trade = calculate_trade_pnl(
-
-open_pos["direction"],
-
-open_pos["entry"],
-
-last_price,
-
-open_pos["qty"],
-
-1.0,
-
-)
-
-pnl += pnl_this_trade
-
-open_pos = {
-
-"direction": direction,
-
-"entry": entry_price,
-
-"qty": qty,
-
-"open_time": entry_time,
-
-"half_closed": False,
-
-}
-
-continue
-
-entry = open_pos["entry"]
-
-direction = open_pos["direction"]
-
-qty = open_pos["qty"]
-
-half_closed = False
+trade_ohlcv_df = ohlcv_df[(ohlcv_df['timestamp'] >= open_pos["open_time"]) & (ohlcv_df['timestamp'] < end_time)]
 
 pnl_this_trade = 0
 
-tp1 = entry * (1.04 if direction == "buy" else 0.96)
+if trade_ohlcv_df.empty:
 
-tp2 = entry * (1.06 if direction == "buy" else 0.94)
+pnl_this_trade = calculate_trade_pnl(open_pos["direction"], open_pos["entry"], entry_price, open_pos["qty"], 1.0)
 
-sl = entry * (0.98 if direction == "buy" else 1.02)
+else:
 
-for bar in ohlcv:
-
-try:
-
-high = float(bar[2])
-
-low = float(bar[3])
-
-close = float(bar[4])
-
-except Exception as e:
-
-print(f"Bar parse error: {bar}, e: {e}")
-
-continue
-
-if not half_closed:
-
-if (direction == "buy" and low <= sl) or (direction == "sell" and high >= sl):
-
-pnl_this_trade += calculate_trade_pnl(
-
-direction, entry, sl, qty, 1.0
-
-)
+entry, pos_direction, pos_qty = open_pos["entry"], open_pos["direction"], open_pos["qty"]
 
 half_closed = False
 
-break
+if pos_direction == "buy": tp1, tp2, sl = entry * config_rules["tp1_ratio"], entry * config_rules["tp2_ratio"], entry * config_rules["sl_ratio"]
 
-if (direction == "buy" and high >= tp1) or (direction == "sell" and low <= tp1):
+else: tp1, tp2, sl = entry * (2 - config_rules["tp1_ratio"]), entry * (2 - config_rules["tp2_ratio"]), entry * (2 - config_rules["sl_ratio"])
 
-pnl_this_trade += calculate_trade_pnl(
+trade_closed_by_logic = False
 
-direction, entry, tp1, qty, 0.5
+for bar_ts, o, h, l, c, v in trade_ohlcv_df.values:
 
-)
+high, low = h * price_multiplier, l * price_multiplier
 
-half_closed = True
+if not half_closed:
+
+if (pos_direction == "buy" and low <= sl) or (pos_direction == "sell" and high >= sl):
+
+pnl_this_trade += calculate_trade_pnl(pos_direction, entry, sl, pos_qty, 1.0); trade_closed_by_logic = True; break
+
+if (pos_direction == "buy" and high >= tp1) or (pos_direction == "sell" and low <= tp1):
+
+pnl_this_trade += calculate_trade_pnl(pos_direction, entry, tp1, pos_qty, 0.5); half_closed = True
 
 if half_closed:
 
-if (direction == "buy" and low <= entry) or (direction == "sell" and high >= entry):
+if (pos_direction == "buy" and low <= entry) or (pos_direction == "sell" and high >= entry):
 
-pnl_this_trade += calculate_trade_pnl(
+pnl_this_trade += calculate_trade_pnl(pos_direction, entry, entry, pos_qty, 0.5); trade_closed_by_logic = True; break
 
-direction, entry, entry, qty, 0.5
+if (pos_direction == "buy" and high >= tp2) or (pos_direction == "sell" and low <= tp2):
 
-)
+pnl_this_trade += calculate_trade_pnl(pos_direction, entry, tp2, pos_qty, 0.5); trade_closed_by_logic = True; break
 
-break
+if not trade_closed_by_logic:
 
-if (direction == "buy" and high >= tp2) or (direction == "sell" and low <= tp2):
+final_close = trade_ohlcv_df['close'].iloc[-1] * price_multiplier
 
-pnl_this_trade += calculate_trade_pnl(
+remaining_portion = 0.5 if half_closed else 1.0
 
-direction, entry, tp2, qty, 0.5
+pnl_this_trade += calculate_trade_pnl(pos_direction, entry, final_close, pos_qty, remaining_portion)
 
-)
+trade_date = datetime.fromtimestamp(open_pos["open_time"], tz=timezone.utc).date()
 
-break
+daily_pnl_map[trade_date] = daily_pnl_map.get(trade_date, 0) + pnl_this_trade
 
-else:
+open_pos = {"direction": direction, "entry": entry_price, "qty": 25000 / entry_price, "open_time": entry_time}
 
-last_price = close if "close" in locals() else entry
+pnl_list = []
 
-pnl_this_trade += calculate_trade_pnl(
+days_range = [(datetime.now(timezone.utc).date() - timedelta(days=i)) for i in range(7, 0, -1)]
 
-direction,
+for day_date in days_range:
 
-entry,
+pnl = daily_pnl_map.get(day_date, 0)
 
-last_price,
+pnl_list.append({"day": day_date.day, "pnl": round(pnl, 2)})
 
-qty,
+print(f"✅ Finished processing for {symbol} on {timeframe}.")
 
-1.0 if not half_closed else 0.5,
-
-)
-
-pnl += pnl_this_trade
-
-open_pos = {
-
-"direction": row["signal"].lower(),
-
-"entry": entry_price,
-
-"qty": qty,
-
-"open_time": entry_time,
-
-"half_closed": False,
-
-}
-
-if open_pos:
-
-try:
-
-print(f"Closing position OHLCV: {symbol}, {open_pos['open_time']} → {day + timedelta(days=1)}")
-
-ohlcv = fetch_ohlcv(
-
-sym_clean,
-
-open_pos["open_time"],
-
-int(
-
-datetime.combine(
-
-day + timedelta(days=1), datetime.min.time()
-
-).timestamp()
-
-),
-
-)
-
-time.sleep(0.15)
-
-except Exception as e:
-
-ohlcv = []
-
-if ohlcv and isinstance(ohlcv[-1], list):
-
-try:
-
-close = float(ohlcv[-1][4])
-
-except Exception:
-
-close = open_pos["entry"]
-
-else:
-
-print(f"Final OHLCV error: {sym_clean}, {day}")
-
-close = open_pos["entry"]
-
-pnl += calculate_trade_pnl(
-
-open_pos["direction"],
-
-open_pos["entry"],
-
-close,
-
-open_pos["qty"],
-
-1.0,
-
-)
-
-open_pos = None
-
-set_pnl_cache(symbol, day.day, round(pnl, 2))
-
-pnl_list.append({"day": day.day, "pnl": round(pnl, 2)})
-
-results[symbol] = pnl_list
-
-return results
+return symbol, pnl_list
 
 if __name__ == "__main__":
 
-import os
+overall_start_time = time.time()
 
-import json
+TIMEFRAMES_TO_RUN = ['1m', '5m', '15m', '30m', '1h']
 
-import shutil
+for timeframe in TIMEFRAMES_TO_RUN:
 
-if os.path.exists("pnl_results.json"):
+print(f"\n{'='*20} STARTING BACKTEST FOR TIMEFRAME: {timeframe} {'='*20}")
 
-os.remove("pnl_results.json")
+start_time_tf = time.time()
 
-print("Old pnl_results.json removed.")
+clear_pnl_cache()
 
-init_pnl_cache_table()
+conn = sqlite3.connect(DB_PATH)
 
-res = run_backtest()
+eight_days_ago_ts = int((datetime.now(timezone.utc) - timedelta(days=8)).timestamp())
 
-with open("pnl_results.json", "w") as f:
+signals_df = pd.read_sql_query(f"SELECT * FROM signals WHERE timeframe='{timeframe}' AND timestamp >= {eight_days_ago_ts}", conn)
 
-json.dump(res, f, indent=2)
+conn.close()
 
-print("New pnl_results.json created.")
+if signals_df.empty:
 
-shutil.copyfile("pnl_results.json", "/????????????????????????????/pnl_results.json")
+print(f"No signals found for timeframe {timeframe}. Skipping.")
 
-print("pnl_results.json copied to public folder.")
+continue
+
+all_symbols = [s for s in signals_df["symbol"].unique() if normalize_symbol(s) not in INDEX_BLACKLIST]
+
+tasks = [(symbol, timeframe, signals_df, eight_days_ago_ts) for symbol in all_symbols]
+
+num_processes = max(1, cpu_count() - 1)
+
+print(f"Starting parallel processing with {num_processes} cores for {len(all_symbols)} symbols...")
+
+with Pool(processes=num_processes) as pool:
+
+results_list = pool.map(process_symbol, tasks)
+
+final_results = {symbol: pnl_data for symbol, pnl_data in results_list if pnl_data}
+
+output_filename = f"pnl_results_{timeframe}.json"
+
+with open(output_filename, "w") as f:
+
+json.dump(final_results, f, indent=2)
+
+print(f"✅ New results file created: {output_filename}")
 
 try:
 
-subprocess.run(["npm", "run", "build"], cwd="/???????????????????????", check=True)
+public_path = os.path.join(FRONTEND_PUBLIC_PATH, output_filename)
 
-print("Frontend build successful.")
+shutil.copyfile(output_filename, public_path)
 
-subprocess.run(["cp", "-r", "build/.", "/??????????????????/"], cwd="/p????????????????", check=True)
+print(f"📁 {output_filename} copied to public folder.")
 
-print("Build files copied to web server directory.")
+except Exception as e:
 
-except subprocess.CalledProcessError as e:
+print(f"❌ File copy or build error: {e}")
 
-print(f"Frontend build error: {e}")
+end_time_tf = time.time()
 
-with open("pnl_results.json", "r") as f:
+print(f"--- Execution time for {timeframe}: {end_time_tf - start_time_tf:.2f} seconds ---")
 
-data_now = f.read()
+overall_end_time = time.time()
 
-with open("/??????????????????????/pnl_results.json", "r") as f:
+print(f"\n{'='*20} ALL BACKTESTS COMPLETED {'='*20}")
 
-data_public = f.read()
+print(f"--- Total execution time for all timeframes: {overall_end_time - overall_start_time:.2f} seconds ---")
 
-if data_now != data_public:
-
-print("WARNING: JSON output mismatch!")
-
-else:
-
-print("JSON output matches. Calculation is consistent.")
