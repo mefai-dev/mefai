@@ -1,0 +1,577 @@
+"""
+Advanced AI-Powered Cryptocurrency Risk Assessment System
+---------------------------------------------------------
+This system combines deep learning, on-chain analytics, and market microstructure
+analysis to provide sophisticated risk scoring and portfolio optimization.
+"""
+
+import numpy as np
+import pandas as pd
+import requests
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import RobustScaler
+from datetime import datetime, timedelta
+import json
+from typing import Dict, Tuple, List
+import time
+import hashlib
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr
+from ta import add_all_ta_features
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands
+from ta.volume import VolumeWeightedAveragePrice
+
+# Configuration
+class Config:
+    COINS = ["BTC", "ETH", "BNB", "SOL", "AVAX", "XRP", "DOGE", "LTC", "ADA", "DOT"]
+    TIMEFRAMES = ["1h", "4h", "1d"]  # Multi-timeframe analysis
+    API_BASE = "https://api.binance.com/api/v3"
+    WINDOW_SIZE = 256  # Increased for better pattern recognition
+    BATCH_SIZE = 32
+    EPOCHS = 500
+    EARLY_STOPPING_PATIENCE = 20
+    RISK_THRESHOLDS = {
+        'low': 0.3,
+        'medium': 0.6,
+        'high': 0.8
+    }
+    
+    @staticmethod
+    def get_headers():
+        return {
+            'User-Agent': 'AI-Risk-Analyzer/2.0',
+            'X-API-KEY': hashlib.sha256(str(time.time()).encode()).hexdigest()[:32]
+        }
+
+
+# Enhanced Deep Learning Architecture
+class MultiHeadAttentionLayer(nn.Module):
+    """Self-attention mechanism for capturing cross-feature relationships"""
+    def __init__(self, input_dim, n_heads=4):
+        super().__init__()
+        self.n_heads = n_heads
+        self.head_dim = input_dim // n_heads
+        
+        self.q_linear = nn.Linear(input_dim, input_dim)
+        self.v_linear = nn.Linear(input_dim, input_dim)
+        self.k_linear = nn.Linear(input_dim, input_dim)
+        self.out_linear = nn.Linear(input_dim, input_dim)
+        
+    def forward(self, x):
+        batch_size = x.size(0)
+        
+        # Linear transformations
+        k = self.k_linear(x).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1,2)
+        q = self.q_linear(x).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1,2)
+        v = self.v_linear(x).view(batch_size, -1, self.n_heads, self.head_dim).transpose(1,2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(q, k.transpose(-2,-1)) / torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32))
+        attention = F.softmax(scores, dim=-1)
+        weighted = torch.matmul(attention, v)
+        
+        # Concatenate heads
+        weighted = weighted.transpose(1,2).contiguous().view(batch_size, -1, self.n_heads * self.head_dim)
+        return self.out_linear(weighted)
+
+
+class TemporalFusionTransformer(nn.Module):
+    """Advanced architecture combining LSTM with attention mechanisms"""
+    def __init__(self, input_size, hidden_size=128, output_size=1, num_layers=3):
+        super().__init__()
+        
+        # Encoder layers
+        self.encoder_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # Attention mechanisms
+        self.temporal_attention = MultiHeadAttentionLayer(hidden_size*2)
+        self.feature_attention = MultiHeadAttentionLayer(hidden_size*2)
+        
+        # Decoder layers
+        self.decoder_lstm = nn.LSTM(
+            input_size=hidden_size*2,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        # Output layers
+        self.risk_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.SiLU(),
+            nn.Linear(hidden_size//2, output_size),
+            nn.Sigmoid()
+        )
+        
+        self.volatility_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.SiLU(),
+            nn.Linear(hidden_size//2, 1),
+            nn.ReLU()
+        )
+        
+    def forward(self, x):
+        # Encoder
+        enc_out, (h_n, c_n) = self.encoder_lstm(x)
+        
+        # Temporal attention
+        temp_attn = self.temporal_attention(enc_out)
+        
+        # Feature attention
+        feat_attn = self.feature_attention(temp_attn)
+        
+        # Decoder
+        dec_out, _ = self.decoder_lstm(feat_attn, (h_n[:1,:,:], c_n[:1,:,:]))  # Use only last layer hidden state
+        
+        # Multi-task outputs
+        risk_score = self.risk_head(dec_out[:,-1,:])
+        volatility = self.volatility_head(dec_out[:,-1,:])
+        
+        return risk_score, volatility
+
+
+# Data Processing Pipeline
+class CryptoDataset(Dataset):
+    """Advanced dataset with on-the-fly processing and caching"""
+    def __init__(self, coins, window_size=Config.WINDOW_SIZE):
+        self.coins = coins
+        self.window_size = window_size
+        self.scaler = RobustScaler()
+        self._preload_data()
+        
+    def _preload_data(self):
+        """Preload and cache data for faster access"""
+        self.data_cache = {}
+        self.labels_cache = {}
+        
+        for coin in self.coins:
+            price_data = self._fetch_multi_timeframe_data(coin)
+            onchain_data = self._fetch_onchain_data(coin)
+            processed_data, labels = self._process_single_asset(coin, price_data, onchain_data)
+            
+            self.data_cache[coin] = processed_data
+            self.labels_cache[coin] = labels
+            
+        # Calculate cross-asset correlations
+        self._calculate_market_metrics()
+        
+    def _fetch_multi_timeframe_data(self, coin: str) -> Dict[str, pd.DataFrame]:
+        """Fetch data across multiple timeframes"""
+        data = {}
+        for tf in Config.TIMEFRAMES:
+            url = f"{Config.API_BASE}/klines?symbol={coin}USDT&interval={tf}&limit={self.window_size}"
+            try:
+                res = requests.get(url, headers=Config.get_headers())
+                res.raise_for_status()
+                data[tf] = self._parse_price_data(res.json(), tf)
+            except Exception as e:
+                print(f"Error fetching data for {coin} ({tf}): {str(e)}")
+                data[tf] = None
+        return data
+    
+    def _parse_price_data(self, raw_data: List, timeframe: str) -> pd.DataFrame:
+        """Parse and enhance price data with technical indicators"""
+        df = pd.DataFrame(raw_data, columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "trades",
+            "taker_buy_base", "taker_buy_quote", "ignore"
+        ])
+        
+        # Convert types
+        numeric_cols = ["open", "high", "low", "close", "volume"]
+        df[numeric_cols] = df[numeric_cols].astype(float)
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Add all technical analysis features
+        df = add_all_ta_features(
+            df, open="open", high="high", low="low", 
+            close="close", volume="volume", fillna=True
+        )
+        
+        # Add custom features
+        df[f'returns_{timeframe}'] = df['close'].pct_change()
+        df[f'volatility_{timeframe}'] = df['close'].rolling(24).std()
+        
+        # Add volume features
+        vwap = VolumeWeightedAveragePrice(
+            high=df['high'],
+            low=df['low'],
+            close=df['close'],
+            volume=df['volume'],
+            window=20
+        )
+        df[f'vwap_{timeframe}'] = vwap.volume_weighted_average_price()
+        
+        return df.dropna()
+    
+    def _fetch_onchain_data(self, coin: str) -> Dict:
+        """Fetch enhanced on-chain metrics (mock version - integrate with Glassnode/etc)"""
+        # In production, replace with actual API calls
+        return {
+            'nvt': np.random.normal(50, 10),
+            'velocity': np.random.uniform(0.5, 2.0),
+            'sopr': np.random.normal(1.0, 0.1),
+            'exchange_netflow': np.random.randint(-1000, 1000),
+            'hashrate': np.random.uniform(1e6, 1e7),
+            'active_addresses': np.random.randint(10000, 50000),
+            'whale_transactions': np.random.randint(10, 100),
+            'fees_usd': np.random.uniform(1000, 100000)
+        }
+    
+    def _process_single_asset(self, coin: str, price_data: Dict, onchain_data: Dict) -> Tuple[np.ndarray, np.ndarray]:
+        """Process data for a single cryptocurrency"""
+        # Combine features from different timeframes
+        features = []
+        
+        for tf in Config.TIMEFRAMES:
+            if price_data[tf] is not None:
+                tf_features = price_data[tf].iloc[-self.window_size:].select_dtypes(include=[np.number])
+                features.append(tf_features.values)
+        
+        # Pad if necessary to ensure consistent shape
+        max_length = max(f.shape[0] for f in features) if features else 0
+        padded_features = []
+        
+        for f in features:
+            if f.shape[0] < max_length:
+                pad_width = ((max_length - f.shape[0], 0), (0, 0))
+                f = np.pad(f, pad_width, mode='edge')
+            padded_features.append(f)
+        
+        # Stack features from different timeframes
+        if padded_features:
+            price_features = np.concatenate(padded_features, axis=1)
+        else:
+            price_features = np.zeros((max_length, 1))
+        
+        # Add on-chain features (repeated for each timestep)
+        onchain_array = np.array(list(onchain_data.values()))
+        onchain_features = np.tile(onchain_array, (price_features.shape[0], 1))
+        
+        # Combine all features
+        full_features = np.concatenate([price_features, onchain_features], axis=1)
+        
+        # Create labels (future returns volatility as risk proxy)
+        if price_data.get('1h') is not None:
+            future_returns = price_data['1h']['close'].pct_change().shift(-24).rolling(12).std()
+            labels = future_returns.values[-self.window_size:]
+            labels = np.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            labels = np.zeros(full_features.shape[0])
+        
+        return full_features, labels
+    
+    def _calculate_market_metrics(self):
+        """Calculate cross-asset metrics and market-wide indicators"""
+        # Calculate correlation matrix
+        closes = []
+        for coin in self.coins:
+            if '1h' in self.data_cache[coin] and self.data_cache[coin]['1h'] is not None:
+                closes.append(self.data_cache[coin]['1h']['close'].values[-self.window_size:])
+        
+        if len(closes) > 1:
+            self.correlation_matrix = pd.DataFrame(closes).T.corr()
+            self.market_beta = {}
+            
+            # Calculate beta to BTC
+            btc_returns = pd.Series(closes[0]).pct_change().dropna()
+            for i, coin in enumerate(self.coins[1:], 1):
+                coin_returns = pd.Series(closes[i]).pct_change().dropna()
+                if len(coin_returns) == len(btc_returns):
+                    cov = np.cov(coin_returns, btc_returns)[0,1]
+                    var = np.var(btc_returns)
+                    self.market_beta[coin] = cov / var if var != 0 else 1.0
+        else:
+            self.correlation_matrix = pd.DataFrame()
+            self.market_beta = {}
+    
+    def __len__(self):
+        return len(self.coins)
+    
+    def __getitem__(self, idx):
+        coin = self.coins[idx]
+        features = self.data_cache[coin]
+        labels = self.labels_cache[coin]
+        
+        # Normalize features
+        features = self.scaler.fit_transform(features)
+        
+        return {
+            'features': torch.FloatTensor(features),
+            'label': torch.FloatTensor([labels[-1]]),  # Last label as target
+            'coin': coin
+        }
+
+
+# Advanced Training System
+class RiskTrainer:
+    def __init__(self, model, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.model = model.to(device)
+        self.device = device
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(), 
+            lr=1e-4, 
+            weight_decay=1e-5
+        )
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, 
+            patience=5, 
+            factor=0.5,
+            verbose=True
+        )
+        self.loss_fn = nn.SmoothL1Loss()  # Huber loss
+        
+    def train_epoch(self, dataloader):
+        self.model.train()
+        total_loss = 0
+        
+        for batch in dataloader:
+            features = batch['features'].to(self.device)
+            labels = batch['label'].to(self.device)
+            
+            self.optimizer.zero_grad()
+            
+            # Forward pass
+            risk_score, volatility = self.model(features.unsqueeze(1))
+            
+            # Calculate loss
+            loss = self.loss_fn(risk_score.squeeze(), labels)
+            
+            # Backward pass
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+        
+        return total_loss / len(dataloader)
+    
+    def evaluate(self, dataloader):
+        self.model.eval()
+        total_loss = 0
+        predictions = []
+        true_labels = []
+        coin_list = []
+        
+        with torch.no_grad():
+            for batch in dataloader:
+                features = batch['features'].to(self.device)
+                labels = batch['label'].to(self.device)
+                
+                risk_score, volatility = self.model(features.unsqueeze(1))
+                
+                loss = self.loss_fn(risk_score.squeeze(), labels)
+                total_loss += loss.item()
+                
+                predictions.extend(risk_score.squeeze().cpu().numpy())
+                true_labels.extend(labels.squeeze().cpu().numpy())
+                coin_list.extend(batch['coin'])
+        
+        metrics = {
+            'loss': total_loss / len(dataloader),
+            'spearman': spearmanr(predictions, true_labels).correlation,
+            'coins': coin_list,
+            'predictions': predictions,
+            'true_labels': true_labels
+        }
+        
+        return metrics
+    
+    def fit(self, train_loader, val_loader, epochs):
+        best_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            train_loss = self.train_epoch(train_loader)
+            val_metrics = self.evaluate(val_loader)
+            
+            self.scheduler.step(val_metrics['loss'])
+            
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"Train Loss: {train_loss:.6f}")
+            print(f"Val Loss: {val_metrics['loss']:.6f}")
+            print(f"Val Spearman: {val_metrics['spearman']:.4f}")
+            
+            # Early stopping
+            if val_metrics['loss'] < best_loss:
+                best_loss = val_metrics['loss']
+                patience_counter = 0
+                torch.save(self.model.state_dict(), 'best_model.pth')
+            else:
+                patience_counter += 1
+                if patience_counter >= Config.EARLY_STOPPING_PATIENCE:
+                    print("Early stopping triggered")
+                    break
+
+
+# Risk Analysis and Portfolio Optimization
+class PortfolioManager:
+    def __init__(self, model, dataset):
+        self.model = model
+        self.dataset = dataset
+        self.risk_assessment = {}
+        self.portfolio_allocation = {}
+        
+    def analyze_risk(self):
+        """Generate comprehensive risk assessment for all assets"""
+        dataloader = DataLoader(self.dataset, batch_size=len(self.dataset.coins), shuffle=False)
+        metrics = self.model.evaluate(dataloader)
+        
+        for i, coin in enumerate(metrics['coins']):
+            self.risk_assessment[coin] = {
+                'risk_score': float(metrics['predictions'][i]),
+                'volatility': float(metrics['true_labels'][i]),
+                'risk_category': self._categorize_risk(metrics['predictions'][i]),
+                'beta_to_btc': self.dataset.market_beta.get(coin, 1.0)
+            }
+        
+        return self.risk_assessment
+    
+    def _categorize_risk(self, score):
+        """Categorize risk into low/medium/high"""
+        if score < Config.RISK_THRESHOLDS['low']:
+            return 'low'
+        elif score < Config.RISK_THRESHOLDS['high']:
+            return 'medium'
+        else:
+            return 'high'
+    
+    def optimize_portfolio(self, risk_tolerance='medium'):
+        """Generate optimal portfolio weights based on risk assessment"""
+        if not self.risk_assessment:
+            self.analyze_risk()
+        
+        # Get valid coins with data
+        valid_coins = [coin for coin in self.dataset.coins if coin in self.risk_assessment]
+        
+        # Filter by risk tolerance
+        if risk_tolerance == 'low':
+            selected_coins = [coin for coin in valid_coins 
+                             if self.risk_assessment[coin]['risk_category'] == 'low']
+        elif risk_tolerance == 'high':
+            selected_coins = valid_coins  # Include all for high tolerance
+        else:  # medium
+            selected_coins = [coin for coin in valid_coins 
+                            if self.risk_assessment[coin]['risk_category'] in ['low', 'medium']]
+        
+        if not selected_coins:
+            selected_coins = valid_coins  # Fallback to all coins if none match
+        
+        # Calculate inverse volatility weights
+        volatilities = np.array([self.risk_assessment[coin]['volatility'] for coin in selected_coins])
+        inv_vol = 1 / (volatilities + 1e-6)  # Add small value to avoid division by zero
+        weights = inv_vol / inv_vol.sum()
+        
+        # Apply risk score adjustment
+        risk_scores = np.array([self.risk_assessment[coin]['risk_score'] for coin in selected_coins])
+        risk_adjustment = 1 / (1 + risk_scores)  # Lower weight for higher risk
+        adjusted_weights = weights * risk_adjustment
+        normalized_weights = adjusted_weights / adjusted_weights.sum()
+        
+        # Create allocation dictionary
+        self.portfolio_allocation = {
+            coin: {
+                'weight': float(weight),
+                'leverage': self._calculate_leverage(self.risk_assessment[coin]['risk_score'])
+            }
+            for coin, weight in zip(selected_coins, normalized_weights)
+        }
+        
+        return self.portfolio_allocation
+    
+    def _calculate_leverage(self, risk_score):
+        """Calculate suggested leverage based on risk"""
+        if risk_score < 0.3:
+            return 3.0  # High confidence
+        elif risk_score < 0.6:
+            return 2.0  # Medium confidence
+        else:
+            return 1.0  # No leverage for high risk
+    
+    def generate_report(self):
+        """Generate comprehensive risk report"""
+        if not self.risk_assessment:
+            self.analyze_risk()
+        if not self.portfolio_allocation:
+            self.optimize_portfolio()
+        
+        report = {
+            'timestamp': datetime.utcnow().isoformat(),
+            'market_conditions': self._assess_market_conditions(),
+            'risk_assessment': self.risk_assessment,
+            'portfolio_allocation': self.portfolio_allocation,
+            'correlation_matrix': self.dataset.correlation_matrix.to_dict(),
+            'market_betas': self.dataset.market_beta
+        }
+        
+        return report
+    
+    def _assess_market_conditions(self):
+        """Analyze overall market conditions"""
+        avg_risk = np.mean([v['risk_score'] for v in self.risk_assessment.values()])
+        avg_volatility = np.mean([v['volatility'] for v in self.risk_assessment.values()])
+        
+        if avg_risk < 0.4 and avg_volatility < 0.02:
+            return 'low_risk'
+        elif avg_risk > 0.7 and avg_volatility > 0.05:
+            return 'high_risk'
+        else:
+            return 'neutral'
+
+
+# Main Execution
+def main():
+    print("Initializing Advanced AI Risk Analyzer...")
+    print(f"Hardware Acceleration: {'GPU' if torch.cuda.is_available() else 'CPU'} available")
+    
+    # Initialize components
+    dataset = CryptoDataset(Config.COINS)
+    model = TemporalFusionTransformer(
+        input_size=dataset[0]['features'].shape[1],
+        hidden_size=128,
+        output_size=1
+    )
+    
+    trainer = RiskTrainer(model)
+    portfolio_manager = PortfolioManager(model, dataset)
+    
+    # Train model (in practice would use proper train/val split)
+    print("\nTraining AI model...")
+    train_loader = DataLoader(dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)
+    trainer.fit(train_loader, val_loader, epochs=Config.EPOCHS)
+    
+    # Generate risk report
+    print("\nGenerating risk assessment...")
+    report = portfolio_manager.generate_report()
+    
+    # Save and display results
+    with open('risk_report.json', 'w') as f:
+        json.dump(report, f, indent=2)
+    
+    print("\n=== AI Risk Assessment Complete ===")
+    print(json.dumps({
+        'market_condition': report['market_conditions'],
+        'top_assets': sorted(
+            [(k, v['risk_score']) for k, v in report['risk_assessment'].items()],
+            key=lambda x: x[1]
+        )[:3],
+        'portfolio_summary': {
+            k: f"{v['weight']:.2%} (Leverage: {v['leverage']:.1f}x)"
+            for k, v in report['portfolio_allocation'].items()
+        }
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()
