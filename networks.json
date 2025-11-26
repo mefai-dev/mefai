@@ -1,8 +1,0 @@
-{
-  "mainnet": {
-    "MarketFactory": {
-      "address": "0xFE0eCCce68bAd7457f08a81937c788762054c06a",
-      "startBlock": 73340154
-    }
-  }
-}
